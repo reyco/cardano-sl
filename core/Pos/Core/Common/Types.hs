@@ -36,11 +36,9 @@ module Pos.Core.Common.Types
        , Coin (..)
        , CoinPortion (..)
        , mkCoin
-       , checkCoin
        , coinF
        , unsafeGetCoin
        , coinPortionDenominator
-       , checkCoinPortion
        , unsafeCoinPortionFromDouble
        , maxCoinVal
 
@@ -77,6 +75,7 @@ import           Pos.Crypto.Hashing (AbstractHash, Hash)
 import           Pos.Crypto.HD (HDAddressPayload)
 import           Pos.Crypto.Signing (PublicKey, RedeemPublicKey)
 import           Pos.Data.Attributes (Attributes)
+import           Pos.Util.Verification (PVerifiable (..), pverFail, runPVerify)
 
 ----------------------------------------------------------------------------
 -- Address, StakeholderId
@@ -284,16 +283,16 @@ slotLeadersF =
 ----------------------------------------------------------------------------
 
 -- | Coin is the least possible unit of currency.
-newtype Coin = Coin
+newtype Coin = UnsafeCoin
     { getCoin :: Word64
     } deriving (Show, Ord, Eq, Generic, Hashable, Data, NFData)
 
 instance Buildable Coin where
-    build (Coin n) = bprint (int%" coin(s)") n
+    build (UnsafeCoin n) = bprint (int%" coin(s)") n
 
 instance Bounded Coin where
-    minBound = Coin 0
-    maxBound = Coin maxCoinVal
+    minBound = UnsafeCoin 0
+    maxBound = UnsafeCoin maxCoinVal
 
 -- | Maximal possible value of 'Coin'.
 maxCoinVal :: Word64
@@ -303,12 +302,16 @@ maxCoinVal = 45000000000000000
 -- it would fail with 'error' if the 'Word64' exceeds 'maxCoinVal', but now you
 -- have to 'checkCoin' if you care about that.
 mkCoin :: Word64 -> Coin
-mkCoin = Coin
+mkCoin x =
+    let c = UnsafeCoin x
+    in case runPVerify c of
+          Left e   -> error $ "mkCoin: " <> show e
+          Right () -> c
 
-checkCoin :: MonadError Text m => Coin -> m ()
-checkCoin (Coin c)
-    | c <= maxCoinVal = pure ()
-    | otherwise       = throwError $ "Coin: " <> show c <> " is too large"
+instance PVerifiable Coin where
+    pverifyOne (UnsafeCoin c)
+        | c <= maxCoinVal = pass
+        | otherwise       = pverFail $ "Coin: " <> show c <> " is too large"
 
 -- | Coin formatter which restricts type.
 coinF :: Format r (Coin -> r)
@@ -330,7 +333,7 @@ unsafeGetCoin = getCoin
 -- To multiply a coin portion by 'Coin', use 'applyCoinPortionDown' (when
 -- calculating number of coins) or 'applyCoinPortionUp' (when calculating a
 -- threshold).
-newtype CoinPortion = CoinPortion
+newtype CoinPortion = UnsafeCoinPortion
     { getCoinPortion :: Word64
     } deriving (Show, Ord, Eq, Generic, Typeable, NFData, Hashable)
 
@@ -339,20 +342,13 @@ coinPortionDenominator :: Word64
 coinPortionDenominator = (10 :: Word64) ^ (15 :: Word64)
 
 instance Bounded CoinPortion where
-    minBound = CoinPortion 0
-    maxBound = CoinPortion coinPortionDenominator
+    minBound = UnsafeCoinPortion 0
+    maxBound = UnsafeCoinPortion coinPortionDenominator
 
--- | Make 'CoinPortion' from 'Word64' checking whether it is not greater
--- than 'coinPortionDenominator'.
-checkCoinPortion
-    :: MonadError Text m
-    => CoinPortion -> m ()
-checkCoinPortion (CoinPortion x)
-    | x <= coinPortionDenominator = pure ()
-    | otherwise = throwError err
-  where
-    err =
-        sformat
+instance PVerifiable CoinPortion where
+    pverifyOne (UnsafeCoinPortion x) =
+        when (x > coinPortionDenominator) $ pverFail $
+            sformat
             ("CoinPortion: value is greater than coinPortionDenominator: "
             %int) x
 
@@ -362,7 +358,7 @@ checkCoinPortion (CoinPortion x)
 -- place.
 unsafeCoinPortionFromDouble :: Double -> CoinPortion
 unsafeCoinPortionFromDouble x
-    | 0 <= x && x <= 1 = CoinPortion v
+    | 0 <= x && x <= 1 = UnsafeCoinPortion v
     | otherwise = error "unsafeCoinPortionFromDouble: double not in [0, 1]"
   where
     v = round $ realToFrac coinPortionDenominator * x
