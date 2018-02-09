@@ -7,7 +7,7 @@ module Pos.Diffusion.Full.Block
     , requestTip
     , announceBlockHeader
     , handleHeadersCommunication
-
+    , streamBlocks
     , blockListeners
     ) where
 
@@ -33,6 +33,7 @@ import           System.Wlog (logDebug, logWarning)
 import           Pos.Binary.Communication ()
 import           Pos.Block.Network (MsgBlock (..), MsgGetBlocks (..), MsgGetHeaders (..),
                                     MsgHeaders (..))
+--import           Pos.Block.Network.Logic (handleBlocks)
 import           Pos.Communication.Limits (HasAdoptedBlockVersionData, recvLimited)
 import           Pos.Communication.Listener (listenerConv)
 import           Pos.Communication.Message ()
@@ -53,7 +54,7 @@ import           Pos.Security.Params (AttackType (..), NodeAttackedError (..),
                                       AttackTarget (..), SecurityParams (..))
 import           Pos.Util (_neHead, _neLast)
 import           Pos.Util.Chrono (NewestFirst (..), _NewestFirst, OldestFirst (..),
-                                  NE, nonEmptyNewestFirst)
+                                  NE, nonEmptyNewestFirst, _OldestFirst, toOldestFirst)
 import           Pos.Util.TimeWarp (nodeIdToAddress, NetworkAddress)
 import           Pos.Util.Timer (Timer, setTimerDuration, startTimer)
 
@@ -258,6 +259,191 @@ getBlocks logic enqueue nodeId tipHeader checkpoints = do
               Just (MsgBlock block) -> do
                   retrieveBlocksDo conv (i - 1) (block : acc)
 
+-- | Stream some blocks
+streamBlocks
+    :: forall d .
+       ( DiffusionWorkMode d
+       , HasAdoptedBlockVersionData d
+       )
+    => Logic d
+    -> EnqueueMsg d
+    -> NodeId
+    -> BlockHeader
+    -> [HeaderHash]
+    -> d ()
+streamBlocks logic enqueue nodeId tipHeader checkpoints = do
+    -- It is apparently an error to request headers for the tipHeader and
+    -- [tipHeader], i.e. 1 checkpoint equal to the header of the block that
+    -- you want. Sure, it's a silly thing to do, but should it be an error?
+    --
+    -- Anyway, the procedure was and still is: if it's just one block you want,
+    -- then you can skip requesting the headers and go straight to requesting
+    -- the block itself.
+    if singleBlockHeader
+       then requestBlocks (NewestFirst (pure tipHeader))
+       else requestHeaders >>= requestBlocks
+  where
+
+    singleBlockHeader :: Bool
+    singleBlockHeader = case checkpoints of
+        [checkpointHash] -> checkpointHash == tipHash
+        _                -> False
+    mgh :: MsgGetHeaders
+    mgh = MsgGetHeaders
+        { mghFrom = checkpoints
+        , mghTo = Just tipHash
+        }
+
+    tipHash :: HeaderHash
+    tipHash = headerHash tipHeader
+
+    -- | Make message which requests chain of blocks which is based on our
+    -- tip. LcaChild is the first block after LCA we don't
+    -- know. WantedBlock is the newest one we want to get.
+    mkBlocksRequest :: HeaderHash -> HeaderHash -> MsgGetBlocks
+    mkBlocksRequest lcaChild wantedBlock =
+        MsgGetBlocks
+        { mgbFrom = lcaChild
+        , mgbTo = wantedBlock
+        }
+
+    requestHeaders :: d (NewestFirst NE BlockHeader)
+    requestHeaders = enqueueMsgSingle
+        enqueue
+        (MsgRequestBlockHeaders (Just (S.singleton nodeId)))
+        (Conversation requestHeadersConversation)
+
+    requestHeadersConversation
+        :: ConversationActions MsgGetHeaders MsgHeaders d
+        -> d (NewestFirst NE BlockHeader)
+    requestHeadersConversation conv = do
+        logDebug $ sformat ("requestHeaders: sending "%build) mgh
+        send conv mgh
+        mHeaders <- recvLimited conv
+        inRecovery <- recoveryInProgress logic
+        -- TODO: it's very suspicious to see False here as RequestHeaders
+        -- is only called when we're in recovery mode.
+        logDebug $ sformat ("requestHeaders: inRecovery = "%shown) inRecovery
+        case mHeaders of
+            Nothing -> do
+                logWarning "requestHeaders: received Nothing as a response on MsgGetHeaders"
+                throwM $ DialogUnexpected $
+                    sformat ("requestHeaders: received Nothing from "%build) nodeId
+            Just (MsgNoHeaders t) -> do
+                logWarning $ "requestHeaders: received MsgNoHeaders: " <> t
+                throwM $ DialogUnexpected $
+                    sformat ("requestHeaders: received MsgNoHeaders from "%
+                             build%", msg: "%stext)
+                            nodeId
+                            t
+            Just (MsgHeaders headers) -> do
+                logDebug $ sformat
+                    ("requestHeaders: received "%int%" headers from nodeId "%build)
+                    (headers ^. _NewestFirst . to NE.length)
+                    nodeId
+                return headers
+
+    requestBlocks :: NewestFirst NE BlockHeader -> d ()
+    requestBlocks headers = enqueueMsgSingle
+        enqueue
+        (MsgRequestBlocks (S.singleton nodeId))
+        (Conversation $ requestBlocksConversation headers)
+
+    segmentSize = 4 :: Word -- XXX
+
+    requestBlocksConversation
+        :: NewestFirst NE BlockHeader
+        -> ConversationActions MsgGetBlocks MsgBlock d
+        -> d ()
+    requestBlocksConversation headers conv = do
+        -- Preserved behaviour from existing logic code: all of the headers
+        -- except for the first and last are tossed away.
+        -- TODO don't be so wasteful [CSL-2148]
+        let headers' = toOldestFirst headers
+        let segs = segmentsOfSize segmentSize $ headers' ^. _OldestFirst
+        logDebug "Requested blocks, waiting for the response"
+        retrieveBlocks conv segs 0
+        return ()
+
+    -- A piece of the block retrieval conversation in which the blocks are
+    -- pulled in one-by-one.
+    retrieveBlocks
+        :: ConversationActions MsgGetBlocks MsgBlock d
+        -> [(BlockHeader, BlockHeader)]
+        -> Word
+        -> d ()
+    retrieveBlocks _ [] 0 = return ()
+    retrieveBlocks conv [] outStandingReq = do
+        retrieveBlock conv
+        retrieveBlocks conv [] (outStandingReq - 1)
+    retrieveBlocks conv (seg:segs) outStandingReq = do
+        (segs',osq) <- if outStandingReq < segmentSize `div` 2
+                          then do
+                              let (oldestHeader, newestHeader) = seg
+                                  newestHash = headerHash newestHeader
+                                  lcaChildHash = headerHash oldestHeader
+                              logDebug $ sformat ("Requesting blocks from "%shortHashF%" to "%shortHashF) lcaChildHash newestHash
+                              send conv $ mkBlocksRequest lcaChildHash newestHash
+                              return $ (NE.tail (seg :| segs), outStandingReq + segmentSize - 1)
+                    else return (segs, outStandingReq - 1)
+        retrieveBlock conv
+        retrieveBlocks conv segs' osq
+
+    retrieveBlock
+        :: ConversationActions MsgGetBlocks MsgBlock d
+        -> d ()
+    retrieveBlock conv = do
+        chainE <- runExceptT (retrieveBlockDo conv)
+        case chainE of
+            Left e -> do
+                let msg = sformat ("Error retrieving blocks from peer: "%build% " "%stext) nodeId e
+                logWarning msg
+                throwM $ DialogUnexpected msg
+            Right _ -> return () -- XXX verify block here to
+
+
+
+
+    -- Content of retrieveBlocks.
+    -- Receive a given number of blocks. If the server doesn't send this
+    -- many blocks, an error will be given.
+    --
+    -- Copied from the old logic but modified to use an accumulator rather
+    -- than fmapping (<|). That changed the order so we're now NewestFirst
+    -- (presumably the server sends them oldest first, as that assumption was
+    -- required for the old version to correctly say OldestFirst).
+    retrieveBlockDo
+        :: ConversationActions MsgGetBlocks MsgBlock d
+        -> ExceptT Text d Block
+    retrieveBlockDo conv = lift (recvLimited conv) >>= \case
+              Nothing ->
+                  throwError $ sformat ("Block retrieval cut short by peer")
+              Just (MsgNoBlock t) ->
+                  throwError $ sformat ("Peer failed to produce block, "%stext) t
+              Just (MsgBlock block) -> return block
+
+
+-- | Get the element at a given index (0-indexed) and the remainder of the
+-- list. If the index is bigger than the list, you get the last element and [].
+takeAtNE :: Word -> NonEmpty a -> (a, [a])
+takeAtNE 0 (a :| rest)       = (a, rest)
+takeAtNE _ (a :| [])         = (a, [])
+takeAtNE n (_ :| (a : rest)) = takeAtNE (n-1) (a :| rest)
+
+-- | takeAtNE but give the first element as well.
+takeAtFirstNE :: Word -> NonEmpty a -> (a, a, [a])
+takeAtFirstNE until (a :| rest) =
+    let (a', as) = takeAtNE until (a :| rest)
+    in  (a, a', as)
+
+segmentsOfSize :: Word -> NonEmpty a -> [(a, a)]
+segmentsOfSize n ne = (first_, last) : case rest of
+    [] -> []
+    (x : xs) -> segmentsOfSize n (x :| xs)
+  where
+    (first_, last, rest) = takeAtFirstNE n ne
+
+
 requestTip
     :: forall d t .
        ( DiffusionWorkMode d
@@ -338,7 +524,7 @@ handleHeadersCommunication
 handleHeadersCommunication logic conv = do
     whenJustM (recvLimited conv) $ \mgh@(MsgGetHeaders {..}) -> do
         logDebug $ sformat ("Got request on handleGetHeaders: "%build) mgh
-        -- FIXME 
+        -- FIXME
         -- Diffusion layer is entirely capable of serving blocks even if the
         -- logic layer is in recovery mode.
         ifM (recoveryInProgress logic) onRecovery $ do
