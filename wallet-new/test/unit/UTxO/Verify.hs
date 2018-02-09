@@ -9,32 +9,32 @@ module UTxO.Verify (
   , verifyBlocksPrefix
   ) where
 
-import Universum
-import Control.Lens ((%=), _Wrapped)
-import Control.Monad.Except
-import Data.Default
-import System.Wlog
+import           Control.Lens ((%=), _Wrapped)
+import           Control.Monad.Except
+import           Data.Default
 import qualified Data.HashMap.Strict as HM
-import qualified Data.HashSet        as HS
-import qualified Data.List.NonEmpty  as NE
-import qualified Data.Map.Strict     as Map
+import qualified Data.HashSet as HS
+import qualified Data.List.NonEmpty as NE
+import qualified Data.Map.Strict as Map
 import qualified Ether
+import           System.Wlog
+import           Universum
 
-import Pos.Block.Error
-import Pos.Block.Logic hiding (verifyBlocksPrefix)
-import Pos.Block.Pure (verifyBlocks)
-import Pos.Block.Slog hiding (slogVerifyBlocks)
-import Pos.Block.Types
-import Pos.Core
-import Pos.DB.Class (MonadGState(..))
-import Pos.Delegation (DlgUndo(..))
-import Pos.Txp hiding (tgsVerifyBlocks)
-import Pos.Update.Poll
-import Pos.Util.Chrono
-import Pos.Util (ether, neZipWith4)
-import Pos.Util.Lens
-import Serokell.Util.Verify
+import           Pos.Block.Error
+import           Pos.Block.Logic hiding (verifyBlocksPrefix)
+import           Pos.Block.Pure (verifyBlocks)
+import           Pos.Block.Slog hiding (slogVerifyBlocks)
+import           Pos.Block.Types
+import           Pos.Core
+import           Pos.DB.Class (MonadGState (..))
+import           Pos.Delegation (DlgUndo (..))
+import           Pos.Txp hiding (tgsVerifyBlocks)
+import           Pos.Update.Poll
+import           Pos.Util (ether, neZipWith4)
+import           Pos.Util.Chrono
+import           Pos.Util.Lens
 import qualified Pos.Util.Modifier as MM
+import           Serokell.Util.Verify
 
 {-------------------------------------------------------------------------------
   Verification environment
@@ -264,7 +264,7 @@ verifyBlocksPrefix tip curSlot leaders lastSlots blocks = do
     pskUndo <- withExceptT VerifyBlocksError $ dlgVerifyBlocks blocks
     -}
     let pskUndo :: OldestFirst NE DlgUndo
-        pskUndo = map (const (DlgUndo [] HS.empty)) slogUndos
+        pskUndo = map (const (DlgUndo mempty HS.empty)) slogUndos
 
     -- Skip update verification
     {-

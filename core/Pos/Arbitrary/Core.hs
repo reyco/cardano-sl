@@ -40,6 +40,7 @@ import qualified Pos.Core.Common.Types as Types
 import           Pos.Core.Configuration (HasGenesisBlockVersionData, HasProtocolConstants,
                                          epochSlots)
 import           Pos.Core.Constants (sharedSeedLength)
+import           Pos.Core.Delegation (HeavyDlgIndex (..), LightDlgIndices (..))
 import qualified Pos.Core.Genesis as G
 import qualified Pos.Core.Slotting as Types
 import           Pos.Core.Slotting.Types (Timestamp (..))
@@ -508,7 +509,7 @@ instance HasCryptoConfiguration => Arbitrary G.GenesisDelegation where
                     []                 -> []
                     (delegate:issuers) -> mkCert (toPublic delegate) <$> issuers
       where
-        mkCert delegatePk issuer = createPsk issuer delegatePk 0
+        mkCert delegatePk issuer = createPsk issuer delegatePk (HeavyDlgIndex 0)
 
 instance Arbitrary G.GenesisWStakeholders where
     arbitrary = G.GenesisWStakeholders <$> arbitrary
@@ -538,7 +539,6 @@ instance (HasCryptoConfiguration, HasProtocolConstants) => Arbitrary G.GenesisDa
             True
         hasKnownFeePolicy _ = False
         arbitraryVssCerts = G.GenesisVssCertificatesMap . mkVssCertificatesMapLossy <$> arbitrary
-
 ----------------------------------------------------------------------------
 -- Arbitrary miscellaneous types
 ----------------------------------------------------------------------------
@@ -557,6 +557,17 @@ instance Arbitrary Second where
 
 deriving instance Arbitrary Types.Timestamp
 deriving instance Arbitrary Types.TimeDiff
+
+instance Arbitrary HeavyDlgIndex where
+    arbitrary = HeavyDlgIndex <$> arbitrary
+    shrink = genericShrink
+
+instance Arbitrary LightDlgIndices where
+    arbitrary = do
+        l <- arbitrary
+        r <- arbitrary
+        pure $ LightDlgIndices $ if r >= l then (l,r) else (r,l)
+    shrink = genericShrink
 
 ----------------------------------------------------------------------------
 -- SSC
