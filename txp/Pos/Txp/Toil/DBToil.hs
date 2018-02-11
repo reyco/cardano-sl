@@ -1,6 +1,6 @@
 {-# LANGUAGE TypeFamilies #-}
 
--- | Instances of 'MonadUtxoRead', 'MonadStakesRead' which use DB.
+-- | Instance of 'MonadStakesRead' which uses DB.
 
 module Pos.Txp.Toil.DBToil
        ( DBToil
@@ -13,8 +13,7 @@ import qualified Ether
 
 import           Pos.DB.Class (MonadDBRead)
 import           Pos.DB.GState.Stakes (getRealStake, getRealTotalStake)
-import           Pos.Txp.DB.Utxo (getTxOut)
-import           Pos.Txp.Toil.Class (MonadStakesRead (..), MonadUtxoRead (..))
+import           Pos.Txp.Toil.Class (MonadStakesRead (..))
 
 data DBToilTag
 
@@ -22,9 +21,6 @@ type DBToil = Ether.TaggedTrans DBToilTag IdentityT
 
 runDBToil :: DBToil m a -> m a
 runDBToil = coerce
-
-instance (MonadDBRead m) => MonadUtxoRead (DBToil m) where
-    utxoGet = getTxOut
 
 instance (MonadDBRead m) => MonadStakesRead (DBToil m) where
     getTotalStake = getRealTotalStake

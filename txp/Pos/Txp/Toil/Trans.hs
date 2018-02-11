@@ -1,7 +1,33 @@
 -- | ToilT monad transformer. Single-threaded.
 
 module Pos.Txp.Toil.Trans
-       ( ToilT
+       (
+         -- * Monadic Utxo
+         UtxoM
+       , utxoGetModified
+       , utxoPut
+       , utxoDel
+
+         -- * Monadic local Toil
+       , LocalToilState (..)
+       , ltsMemPool
+       , ltsUtxoModifier
+       , ltsUndos
+       , LocalToilM
+       , hasTx
+       , memPoolSize
+       , putTxWithUndo
+
+         -- * Monadic global Toil
+       , GlobalToilState (..)
+       , GlobalToilM
+
+         -- * Conversions
+       , utxoMToLocalToilM
+       , utxoMToGlobalToilM
+
+         -- * Old code
+       , ToilT
        , runToilTGlobal
        , runToilTLocal
        , execToilTLocal
@@ -11,21 +37,124 @@ module Pos.Txp.Toil.Trans
 
 import           Universum
 
-import           Control.Lens (at, to, (%=), (+=), (.=))
+import           Control.Lens (at, makeLenses, zoom, (%=), (+=), (.=))
+import           Control.Monad.Reader (mapReaderT)
 import           Data.Default (Default (def))
-import qualified Data.HashMap.Strict as HM
 import qualified Ether
+import           Fmt ((+|), (|+))
+import           System.Wlog (NamedPureLogger)
 
-import           Pos.Txp.Toil.Class (MonadStakes (..), MonadStakesRead (..), MonadTxPool (..),
-                                     MonadUtxo (..), MonadUtxoRead (..))
-import           Pos.Txp.Toil.Types (GenericToilModifier (..), MemPool, ToilModifier, UndoMap,
-                                     UtxoModifier, mpLocalTxs, mpSize, svStakes, svTotal, tmMemPool,
-                                     tmStakes, tmUndos, tmUtxo)
+import           Pos.Core.Txp (TxAux, TxId, TxIn, TxOutAux, TxUndo)
+import           Pos.Txp.Toil.Class (MonadStakes (..), MonadStakesRead (..))
+import           Pos.Txp.Toil.Types (GenericToilModifier (..), MemPool, StakesView, ToilModifier,
+                                     UndoMap, UtxoLookup, UtxoModifier, mpLocalTxs, mpSize,
+                                     svStakes, svTotal, tmStakes)
 import qualified Pos.Util.Modifier as MM
 import           Pos.Util.Util (ether)
 
 ----------------------------------------------------------------------------
--- Tranformer
+-- Monadic actions with Utxo.
+----------------------------------------------------------------------------
+
+-- | Utility monad which allows to lookup values in UTXO and modify it.
+type UtxoM = ReaderT UtxoLookup (State UtxoModifier)
+
+-- | Look up an entry in 'Utxo' considering 'UtxoModifier' stored
+-- inside 'State'.
+utxoGetModified :: TxIn -> UtxoM (Maybe TxOutAux)
+utxoGetModified txIn = do
+    utxoGet <- ask
+    MM.lookup utxoGet txIn <$> use identity
+
+-- | Add an unspent output to UTXO. If it's already there, throw an 'error'.
+utxoPut :: TxIn -> TxOutAux -> UtxoM ()
+utxoPut id txOut = utxoGetModified id >>= \case
+    Nothing -> identity %= MM.insert id txOut
+    Just _  ->
+        -- TODO [CSL-2173]: Comment
+        error ("utxoPut: "+|id|+" is already in utxo")
+
+-- | Delete an unspent input from UTXO. If it's not there, throw an 'error'.
+utxoDel :: TxIn -> UtxoM ()
+utxoDel id = utxoGetModified id >>= \case
+    Just _  -> identity %= MM.delete id
+    Nothing ->
+        -- TODO [CSL-2173]: Comment
+        error ("utxoDel: "+|id|+" is not in the utxo")
+
+----------------------------------------------------------------------------
+-- Monad used for local Toil and some actions.
+----------------------------------------------------------------------------
+
+data LocalToilState = LocalToilState
+    { _ltsMemPool      :: !MemPool
+    , _ltsUtxoModifier :: !UtxoModifier
+    , _ltsUndos        :: !UndoMap
+    }
+
+makeLenses ''LocalToilState
+
+type LocalToilM = ReaderT UtxoLookup (State LocalToilState)
+
+-- | Check whether Tx with given identifier is stored in the pool.
+hasTx :: TxId -> LocalToilM Bool
+hasTx id = isJust <$> use (ltsMemPool . mpLocalTxs . at id)
+
+-- | Put a transaction with corresponding 'TxUndo' into MemPool.
+-- Transaction must not be in MemPool (but it's checked anyway).
+putTxWithUndo :: TxId -> TxAux -> TxUndo -> LocalToilM ()
+putTxWithUndo id tx undo =
+    unlessM (hasTx id) $ do
+        ltsMemPool . mpLocalTxs . at id .= Just tx
+        ltsMemPool . mpSize += 1
+        ltsUndos . at id .= Just undo
+
+-- | Return the number of transactions contained in the pool.
+memPoolSize :: LocalToilM Int
+memPoolSize = use $ ltsMemPool . mpSize
+
+----------------------------------------------------------------------------
+-- Monad used for global Toil and some actions.
+----------------------------------------------------------------------------
+
+data GlobalToilState = GlobalToilState
+    { _gtsUtxoModifier   :: !UtxoModifier
+    , _gtsStakesModifier :: !StakesView
+    }
+
+makeLenses ''GlobalToilState
+
+type GlobalToilM = NamedPureLogger (ReaderT UtxoLookup (State GlobalToilState))
+
+
+
+
+
+----------------------------------------------------------------------------
+-- Conversions
+----------------------------------------------------------------------------
+
+-- | Lift 'UtxoM' action to 'LocalToilM'.
+utxoMToLocalToilM :: UtxoM a -> LocalToilM a
+utxoMToLocalToilM = mapReaderT f
+  where
+    f :: forall a. State UtxoModifier a -> State LocalToilState a
+    f = zoom ltsUtxoModifier
+
+-- | Lift 'UtxoM' action to 'GlobalToilM'.
+utxoMToGlobalToilM :: UtxoM a -> GlobalToilM a
+utxoMToGlobalToilM = lift . mapReaderT f
+  where
+    f :: forall a. State UtxoModifier a -> State GlobalToilState a
+    f = zoom gtsUtxoModifier
+
+
+
+
+
+
+----------------------------------------------------------------------------
+-- Obsolete
 ----------------------------------------------------------------------------
 
 -- | Monad transformer which stores ToilModifier and implements
@@ -35,13 +164,6 @@ import           Pos.Util.Util (ether)
 -- single-threaded usage only.
 -- Used for block application now.
 type ToilT ext m = Ether.StateT' (GenericToilModifier ext) m
-
-instance MonadUtxoRead m => MonadUtxoRead (ToilT __ m) where
-    utxoGet id = ether $ MM.lookupM utxoGet id =<< use tmUtxo
-
-instance MonadUtxoRead m => MonadUtxo (ToilT __ m) where
-    utxoPutUnchecked id aux = ether $ tmUtxo %= MM.insert id aux
-    utxoDelUnchecked id     = ether $ tmUtxo %= MM.delete id
 
 instance MonadStakesRead m => MonadStakesRead (ToilT __ m) where
     getStake id =
@@ -53,18 +175,6 @@ instance MonadStakesRead m => MonadStakes (ToilT __ m) where
     setStake id c = ether $ tmStakes . svStakes . at id .= Just c
 
     setTotalStake c = ether $ tmStakes . svTotal .= Just c
-
-instance Monad m => MonadTxPool (ToilT __ m) where
-    hasTx id = ether $ use $ tmMemPool . mpLocalTxs . to (HM.member id)
-
-    putTxWithUndo id tx undo = ether $ do
-        has <- use $ tmMemPool . mpLocalTxs . to (HM.member id)
-        unless has $ do
-            tmMemPool . mpLocalTxs . at id .= Just tx
-            tmMemPool . mpSize += 1
-            tmUndos . at id .= Just undo
-
-    poolSize = ether $ use $ tmMemPool . mpSize
 
 ----------------------------------------------------------------------------
 -- Runners

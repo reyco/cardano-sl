@@ -2,6 +2,7 @@
 
 module Pos.Txp.Toil.Utxo.Functions
        ( VTxContext (..)
+       , VerifyTxUtxoRes (..)
        , verifyTxUtxo
        , applyTxToUtxo
        , rollbackTxUtxo
@@ -10,7 +11,7 @@ module Pos.Txp.Toil.Utxo.Functions
 import           Universum
 
 import           Control.Lens (_Left)
-import           Control.Monad.Error.Class (MonadError (..))
+import           Control.Monad.Except (throwError)
 import qualified Data.List.NonEmpty as NE
 import           Formatting (int, sformat, (%))
 import           Serokell.Util (VerificationRes, allDistinct, enumerate, formatFirstError,
@@ -27,8 +28,8 @@ import           Pos.Crypto (SignTag (SignRedeemTx, SignTx), WithHash (..), chec
                              redeemCheckSig)
 import           Pos.Data.Attributes (Attributes (attrRemain), areAttributesKnown)
 import           Pos.Script (Script (..), isKnownScriptVersion, txScriptCheck)
-import           Pos.Txp.Toil.Class (MonadUtxo (..), utxoDel, utxoPut)
 import           Pos.Txp.Toil.Failure (ToilVerFailure (..), WitnessVerFailure (..))
+import           Pos.Txp.Toil.Trans (UtxoM, utxoDel, utxoPut)
 import           Pos.Txp.Toil.Types (TxFee (..), UtxoLookup)
 
 ----------------------------------------------------------------------------
@@ -60,7 +61,7 @@ data VerifyTxUtxoRes = VerifyTxUtxoRes
     -- are inputs of unknown types.
     }
 
--- | CHECK: Verify Tx correctness using 'MonadUtxoRead'.
+-- | CHECK: Verify Tx correctness using 'UtxoLookup'.
 -- Specifically there are the following checks:
 --
 -- * every input is a known unspent output;
@@ -190,11 +191,11 @@ verifyKnownInputs VTxContext {..} resolvedInputs TxAux {..} = do
     allInputsDifferent = allDistinct (toList (map fst resolvedInputs))
 
     checkInput
-        :: (HasConfiguration, MonadError ToilVerFailure m)
+        :: (HasConfiguration)
         => Word32           -- ^ Input index
         -> (TxIn, TxOutAux) -- ^ Input and corresponding output data
         -> TxInWitness
-        -> m ()
+        -> Either ToilVerFailure ()
     checkInput i (txIn, toa@(TxOutAux txOut@TxOut{..})) witness = do
         unless (checkSpendingData txOutAddress witness) $
             throwError $ ToilWitnessDoesntMatch i txIn txOut witness
@@ -239,19 +240,17 @@ verifyAttributesAreKnown attrs =
 
 -- | Remove unspent outputs used in given transaction, add new unspent
 -- outputs.
-applyTxToUtxo :: MonadUtxo m => WithHash Tx -> m ()
+applyTxToUtxo :: WithHash Tx -> UtxoM ()
 applyTxToUtxo (WithHash UnsafeTx {..} txid) = do
     mapM_ utxoDel $ filter (not . isTxInUnknown) (toList _txInputs)
     mapM_ applyOutput . zip [0 ..] . toList . map TxOutAux $ _txOutputs
   where
-    applyOutput (idx, toa) = utxoPut (TxInUtxo  txid idx) toa
+    applyOutput (idx, toa) = utxoPut (TxInUtxo txid idx) toa
 
 -- | Rollback application of given transaction to Utxo using Undo
 -- data.  This function assumes that transaction has been really
 -- applied and doesn't check anything.
-rollbackTxUtxo
-    :: (MonadUtxo m)
-    => (TxAux, TxUndo) -> m ()
+rollbackTxUtxo :: (TxAux, TxUndo) -> UtxoM ()
 rollbackTxUtxo (txAux, undo) = do
     let tx@UnsafeTx {..} = taTx txAux
     let txid = hash tx
