@@ -15,8 +15,6 @@ module Pos.Txp.Toil.Logic
        , LocalToilMode
        , normalizeToil
        , processTx
-
-       , verifyAndApplyTx
        ) where
 
 import           Universum
@@ -40,7 +38,7 @@ import           Pos.Txp.Toil.Class (MonadStakes (..), MonadTxPool (..), MonadUt
                                      MonadUtxoRead (..))
 import           Pos.Txp.Toil.Failure (ToilVerFailure (..))
 import           Pos.Txp.Toil.Stakes (applyTxsToStakes, rollbackTxsStakes)
-import           Pos.Txp.Toil.Types (TxFee (..))
+import           Pos.Txp.Toil.Types (TxFee (..), UtxoLookup)
 import qualified Pos.Txp.Toil.Utxo as Utxo
 import           Pos.Txp.Topsort (topsortTxs)
 
@@ -142,43 +140,35 @@ verifyAndApplyTx
        )
     => EpochIndex -> Bool -> (TxId, TxAux) -> m TxUndo
 verifyAndApplyTx curEpoch verifyVersions tx@(_, txAux) = do
-    (txUndo, txFeeMB) <- Utxo.verifyTxUtxo ctx txAux
+    (txUndo, txFeeMB) <- undefined -- Utxo.verifyTxUtxo ctx txAux
+    bvd <- gsAdoptedBVData
     verifyGState curEpoch txAux txFeeMB
     applyTxToUtxo' tx
     pure txUndo
   where
     ctx = Utxo.VTxContext verifyVersions
 
-isRedeemTx :: MonadUtxoRead m => TxAux -> m Bool
-isRedeemTx txAux = do
-    resolvedOuts <- traverse utxoGet $ (view txInputs . taTx) txAux
-    let inputAddresses = fmap (txOutAddress . toaOut) . catMaybes . toList $ resolvedOuts
-    return $ all isRedeemAddress inputAddresses
+isRedeemTx :: UtxoLookup -> TxAux ->  Bool
+isRedeemTx utxoGet txAux = all isRedeemAddress inputAddresses
+  where
+    resolvedOuts = map utxoGet $ (view txInputs . taTx) txAux
+    inputAddresses =
+        fmap (txOutAddress . toaOut) . catMaybes . toList $ resolvedOuts
 
-verifyGState
-    :: ( MonadGState m
-       , MonadUtxoRead m
-       , MonadError ToilVerFailure m
-       )
-    => EpochIndex -> TxAux -> Maybe TxFee -> m ()
-verifyGState curEpoch txAux txFeeMB = do
-    BlockVersionData {..} <- gsAdoptedBVData
-    verifyBootEra curEpoch txAux
+verifyGState :: EpochIndex -> TxAux -> Maybe TxFee -> Either ToilVerFailure ()
+verifyGState bvd@BlockVersionData {..} curEpoch txAux txFeeMB = do
+    verifyBootEra bvd curEpoch txAux
     let txSize = biSize txAux
     let limit = bvdMaxTxSize
-    unlessM (isRedeemTx txAux) $ whenJust txFeeMB $ \txFee ->
+    unless (isRedeemTx undefined txAux) $ whenJust txFeeMB $ \txFee ->
         verifyTxFeePolicy txFee bvdTxFeePolicy txSize
     when (txSize > limit) $
         throwError ToilTooLargeTx {ttltSize = txSize, ttltLimit = limit}
 
-verifyBootEra
-    :: forall m .
-       ( MonadError ToilVerFailure m
-       , MonadGState m
-       )
-    => EpochIndex -> TxAux -> m ()
-verifyBootEra curEpoch TxAux {..} = do
-    whenM (gsIsBootstrapEra curEpoch) $
+verifyBootEra ::
+       BlockVersionData -> EpochIndex -> TxAux -> Either ToilVerFailure ()
+verifyBootEra bvd curEpoch TxAux {..} = do
+    when (isBootstrapEraBVD bvd curEpoch) $
         whenNotNull notBootstrapDistrAddresses $
         throwError . ToilNonBootstrapDistr
   where
@@ -192,12 +182,8 @@ verifyBootEra curEpoch TxAux {..} = do
             BootstrapEraDistr -> True
             _                 -> False
 
-verifyTxFeePolicy
-    :: MonadError ToilVerFailure m
-    => TxFee
-    -> Fee.TxFeePolicy
-    -> Byte
-    -> m ()
+verifyTxFeePolicy ::
+       TxFee -> Fee.TxFeePolicy -> Byte -> Either ToilVerFailure ()
 verifyTxFeePolicy (TxFee txFee) policy txSize = case policy of
     Fee.TxFeePolicyTxSizeLinear txSizeLinear -> do
         let

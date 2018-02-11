@@ -27,9 +27,9 @@ import           Pos.Crypto (SignTag (SignRedeemTx, SignTx), WithHash (..), chec
                              redeemCheckSig)
 import           Pos.Data.Attributes (Attributes (attrRemain), areAttributesKnown)
 import           Pos.Script (Script (..), isKnownScriptVersion, txScriptCheck)
-import           Pos.Txp.Toil.Class (MonadUtxo (..), MonadUtxoRead (..), utxoDel, utxoPut)
+import           Pos.Txp.Toil.Class (MonadUtxo (..), utxoDel, utxoPut)
 import           Pos.Txp.Toil.Failure (ToilVerFailure (..), WitnessVerFailure (..))
-import           Pos.Txp.Toil.Types (TxFee (..))
+import           Pos.Txp.Toil.Types (TxFee (..), UtxoLookup)
 
 ----------------------------------------------------------------------------
 -- Verification
@@ -44,9 +44,21 @@ data VTxContext = VTxContext
     { -- | Verify that script versions in tx are known, addresses' and
       -- witnesses' types are known, attributes are known too.
       vtcVerifyAllIsKnown :: !Bool
+    , -- | Subset of UTXO relevant for verifying a particular
+      -- transaction.
+      vtcUtxo             :: !UtxoLookup
 --    , vtcSlotId   :: !SlotId         -- ^ Slot id of block transaction is checked in
 --    , vtcLeaderId :: !StakeholderId  -- ^ Leader id of block transaction is checked in
-    } deriving (Show)
+    }
+
+-- | Result of successful 'Tx' verification based on Utxo.
+data VerifyTxUtxoRes = VerifyTxUtxoRes
+    { vturUndo :: !TxUndo
+    -- ^ 'TxUndo' for the verified transaction.
+    , vturFee  :: !(Maybe TxFee)
+    -- ^ Fee of the verified transaction. Can be 'Nothing' if there
+    -- are inputs of unknown types.
+    }
 
 -- | CHECK: Verify Tx correctness using 'MonadUtxoRead'.
 -- Specifically there are the following checks:
@@ -65,13 +77,11 @@ data VTxContext = VTxContext
 -- blocks when we're creating a block (because transactions for
 -- inclusion into blocks are verified with 'vtcVerifyAllIsKnown'
 -- set to 'True', so unknown script versions are rejected).
---
--- Returned fee can be 'Nothing' if there are inputs of unknown types.
-verifyTxUtxo
-    :: (MonadUtxoRead m, MonadError ToilVerFailure m)
+verifyTxUtxo ::
+       HasConfiguration
     => VTxContext
     -> TxAux
-    -> m (TxUndo, Maybe TxFee)
+    -> Either ToilVerFailure VerifyTxUtxoRes
 verifyTxUtxo ctx@VTxContext {..} ta@(TxAux UnsafeTx {..} witnesses) = do
     let unknownTxInMB = find (isTxInUnknown . snd) $ zip [0..] (toList _txInputs)
     case (vtcVerifyAllIsKnown, unknownTxInMB) of
@@ -80,30 +90,38 @@ verifyTxUtxo ctx@VTxContext {..} ta@(TxAux UnsafeTx {..} witnesses) = do
         (False, Just _) -> do
             -- Case when at least one input isn't known
             minimalReasonableChecks
-            resolvedInputs <- mapM (fmap rightToMaybe . runExceptT . resolveInput) _txInputs
-            pure (map (fmap snd) resolvedInputs, Nothing)
+            let resolvedInputs :: NonEmpty (Maybe (TxIn, TxOutAux))
+                resolvedInputs = map (rightToMaybe . resolveInput ctx) _txInputs
+            pure VerifyTxUtxoRes
+                 { vturUndo = map (fmap snd) resolvedInputs
+                 , vturFee = Nothing
+                 }
         _               -> do
             -- Case when all inputs are known
             minimalReasonableChecks
-            resolvedInputs <- mapM resolveInput _txInputs
+            resolvedInputs <- mapM (resolveInput ctx) _txInputs
             txFee <- verifySums resolvedInputs _txOutputs
             verifyKnownInputs ctx resolvedInputs ta
             when vtcVerifyAllIsKnown $ verifyAttributesAreKnown _txAttributes
-            pure (map (Just . snd) resolvedInputs, Just txFee)
+            pure VerifyTxUtxoRes
+                 { vturUndo = map (Just . snd) resolvedInputs
+                 , vturFee = Just txFee
+                 }
   where
+    minimalReasonableChecks :: Either ToilVerFailure ()
     minimalReasonableChecks = do
         verifyConsistency _txInputs witnesses
         verResToMonadError (ToilInvalidOutputs . formatFirstError) $
             verifyOutputs ctx ta
 
-resolveInput
-    :: (MonadUtxoRead m, MonadError ToilVerFailure m)
-    => TxIn -> m (TxIn, TxOutAux)
-resolveInput txIn = (txIn, ) <$> (note (ToilNotUnspent txIn) =<< utxoGet txIn)
+resolveInput :: VTxContext -> TxIn -> Either ToilVerFailure (TxIn, TxOutAux)
+resolveInput VTxContext {..} txIn =
+    (txIn, ) <$> (maybeToRight (ToilNotUnspent txIn) (vtcUtxo txIn))
 
-verifySums
-    :: MonadError ToilVerFailure m
-    => NonEmpty (TxIn, TxOutAux) -> NonEmpty TxOut -> m TxFee
+verifySums ::
+       NonEmpty (TxIn, TxOutAux)
+    -> NonEmpty TxOut
+    -> Either ToilVerFailure TxFee
 verifySums resolvedInputs outputs =
   case mTxFee of
       Nothing -> throwError $
@@ -119,7 +137,7 @@ verifySums resolvedInputs outputs =
     outSum = sumCoins $ map txOutValue outputs
     inpSum = sumCoins $ map (txOutValue . toaOut . snd) resolvedInputs
 
-verifyConsistency :: MonadError ToilVerFailure m => NonEmpty TxIn -> TxWitness -> m ()
+verifyConsistency :: NonEmpty TxIn -> TxWitness -> Either ToilVerFailure ()
 verifyConsistency inputs witnesses
     | length inputs == length witnesses = pass
     | otherwise = throwError $ ToilInconsistentTxAux errMsg
@@ -153,11 +171,11 @@ verifyOutputs VTxContext {..} (TxAux UnsafeTx {..} _) =
 -- Verify inputs of a transaction after they have been resolved
 -- (implies that they are known).
 verifyKnownInputs ::
-       (HasConfiguration, MonadError ToilVerFailure m)
+       (HasConfiguration)
     => VTxContext
     -> NonEmpty (TxIn, TxOutAux)
     -> TxAux
-    -> m ()
+    -> Either ToilVerFailure ()
 verifyKnownInputs VTxContext {..} resolvedInputs TxAux {..} = do
     unless allInputsDifferent $ throwError ToilRepeatedInput
     mapM_ (uncurry3 checkInput) $
@@ -214,8 +232,7 @@ verifyKnownInputs VTxContext {..} resolvedInputs TxAux {..} = do
                 throwError $ WitnessUnknownType t
 
 verifyAttributesAreKnown
-    :: (MonadError ToilVerFailure m)
-    => TxAttributes -> m ()
+    :: TxAttributes -> Either ToilVerFailure ()
 verifyAttributesAreKnown attrs =
     unless (areAttributesKnown attrs) $
     throwError $ ToilUnknownAttributes (attrRemain attrs)
