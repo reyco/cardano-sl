@@ -22,6 +22,7 @@ module Pos.Txp.Toil.Monadic
 
          -- * Monadic global Toil
        , GlobalToilState (..)
+       , GlobalToilEnv (..)
        , GlobalToilM
        , getStake
        , getTotalStake
@@ -35,9 +36,9 @@ module Pos.Txp.Toil.Monadic
 
 import           Universum
 
-import           Control.Lens (at, magnify, makeLenses, zoom, (%=), (+=), (.=))
+import           Control.Lens (at, makeLenses, zoom, (%=), (+=), (.=))
 import           Control.Monad.Free (Free (..), hoistFree)
-import           Control.Monad.Reader (mapReaderT)
+import           Control.Monad.State.Strict (mapStateT)
 import           Fmt ((+|), (|+))
 import           System.Wlog (NamedPureLogger)
 
@@ -61,7 +62,7 @@ type UtxoM = StateT UtxoModifier (Free UtxoLookupF)
 -- | Look up an entry in 'Utxo' considering 'UtxoModifier' stored
 -- inside 'State'.
 utxoGet :: TxIn -> UtxoM (Maybe TxOutAux)
-utxoGet txIn = do
+utxoGet txIn =
     MM.lookupM baseLookup txIn =<< use identity
   where
     baseLookup :: TxIn -> UtxoM (Maybe TxOutAux)
@@ -142,10 +143,11 @@ type GlobalToilM
      = NamedPureLogger (ReaderT GlobalToilEnv (StateT GlobalToilState (Free GlobalLookupF)))
 
 getStake :: StakeholderId -> GlobalToilM (Maybe Coin)
-getStake id = lift $ do
-    undefined
-    -- stakesLookup <- view gteStakes
-    -- (<|> stakesLookup id) <$> (use (gtsStakesView . svStakes . at id))
+getStake id =
+    (<|>) <$> lift (use (gtsStakesView . svStakes . at id)) <*> baseLookup id
+  where
+    baseLookup :: StakeholderId -> GlobalToilM (Maybe Coin)
+    baseLookup i = lift $ lift $ lift $ Free $ GlobalLookupStakes i pure
 
 getTotalStake :: GlobalToilM Coin
 getTotalStake =
@@ -168,7 +170,10 @@ utxoMToLocalToilM = zoom ltsUtxoModifier
 -- | Lift 'UtxoM' action to 'GlobalToilM'.
 utxoMToGlobalToilM :: UtxoM a -> GlobalToilM a
 utxoMToGlobalToilM =
-    lift . lift . zoom gtsUtxoModifier . hoistFree GlobalLookupUtxo
+    lift . lift . zoom gtsUtxoModifier . mapStateT hoistFree'
+  where
+    hoistFree' :: forall a. Free UtxoLookupF a -> Free GlobalLookupF a
+    hoistFree' = hoistFree GlobalLookupUtxo
 
 
 
