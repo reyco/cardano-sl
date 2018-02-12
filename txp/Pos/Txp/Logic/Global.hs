@@ -10,7 +10,7 @@ module Pos.Txp.Logic.Global
        , ApplyBlocksSettings (..)
        -- , applyBlocksWith
        -- , blundToAuxNUndo
-       -- , genericToilModifierToBatch
+       , genericGlobalToilStateToBatch
        -- , runToilAction
        ) where
 
@@ -27,13 +27,16 @@ import           Pos.Core.Configuration (HasConfiguration)
 import           Pos.Core.Txp (TxAux, TxUndo, TxpUndo)
 import           Pos.DB (MonadDBRead, SomeBatchOp (..))
 import           Pos.DB.Class (gsAdoptedBVData)
+import qualified Pos.DB.GState.Stakes as DB
 import           Pos.Exception (assertionFailed)
 import           Pos.Txp.Base (flattenTxPayload)
 import qualified Pos.Txp.DB as DB
 import           Pos.Txp.Settings.Global (TxpBlock, TxpBlund, TxpGlobalApplyMode,
                                           TxpGlobalRollbackMode, TxpGlobalSettings (..),
                                           TxpGlobalVerifyMode)
-import           Pos.Txp.Toil (StakesView (..), ToilVerFailure, UtxoM, applyToil, rollbackToil,
+import           Pos.Txp.Toil (GlobalToilEnv (..), GlobalToilM, GlobalToilState (..),
+                               StakesView (..), ToilVerFailure, UtxoM, applyToil,
+                               defGlobalToilState, evalUtxoM, rollbackToil, runGlobalToilM,
                                runUtxoM, verifyToil)
 import           Pos.Util.AssertMode (inAssertMode)
 import           Pos.Util.Chrono (NE, NewestFirst (..), OldestFirst (..))
@@ -48,7 +51,7 @@ txpGlobalSettings =
     TxpGlobalSettings
     { tgsVerifyBlocks = verifyBlocks
     , tgsApplyBlocks = undefined -- applyBlocksWith applyBlocksSettings
-    , tgsRollbackBlocks = undefined -- rollbackBlocks
+    , tgsRollbackBlocks = rollbackBlocks
     }
 
 verifyBlocks ::
@@ -64,7 +67,7 @@ verifyBlocks verifyAllIsKnown newChain =
                 runExceptT .
                 verifyToil bvd epoch verifyAllIsKnown . convertPayload
             verifyDo :: TxpBlock -> m (Either ToilVerFailure TxpUndo)
-            verifyDo = fmap fst . runUtxoM mempty DB.getTxOut . verifyPure
+            verifyDo = evalUtxoM mempty DB.getTxOut . verifyPure
         mapM (ExceptT . verifyDo) newChain
   where
     epoch = NE.last (getOldestFirst newChain) ^. epochIndexL
@@ -101,22 +104,38 @@ data ApplyBlocksSettings extra m = ApplyBlocksSettings
 --     genericToilModifierToBatch absExtraOperations . snd <$>
 --         runToilAction (mapM absApplySingle blunds)
 
--- rollbackBlocks
---     :: TxpGlobalRollbackMode m
---     => NewestFirst NE TxpBlund -> m SomeBatchOp
--- rollbackBlocks blunds =
---     toilModifierToBatch . snd <$>
---     runToilAction (mapM (rollbackToil . blundToAuxNUndo) blunds)
+rollbackBlocks ::
+       forall m. TxpGlobalRollbackMode m
+    => NewestFirst NE TxpBlund
+    -> m SomeBatchOp
+rollbackBlocks blunds = convert <$> do
+    totalStake <- DB.getRealTotalStake
+    let env = GlobalToilEnv totalStake
+        rollbackPure :: TxpBlund -> GlobalToilM ()
+        rollbackPure = rollbackToil . blundToAuxNUndo
+        rollbackDo :: GlobalToilState -> TxpBlund -> m GlobalToilState
+        rollbackDo gts =
+            fmap snd .
+            runGlobalToilM env gts DB.getTxOut DB.getRealStake .
+            rollbackPure
+    foldM rollbackDo defGlobalToilState blunds
+  where
+    convert :: GlobalToilState -> SomeBatchOp
+    convert = undefined
+
+-- toilModifierToBatch . snd <$>
+-- runToilAction (mapM (rollbackToil . blundToAuxNUndo) blunds)
 
 ----------------------------------------------------------------------------
 -- Helpers
 ----------------------------------------------------------------------------
 
--- -- | Convert 'GenericToilModifier' to batch of database operations.
--- genericToilModifierToBatch :: HasConfiguration
---                            => (e -> SomeBatchOp)
---                            -> GenericToilModifier e
---                            -> SomeBatchOp
+-- | Convert 'GenericToilModifier' to batch of database operations.
+genericGlobalToilStateToBatch :: HasConfiguration
+                           => (e -> SomeBatchOp)
+                           -> GlobalToilState
+                           -> SomeBatchOp
+genericGlobalToilStateToBatch = undefined
 -- genericToilModifierToBatch convertExtra modifier =
 --     SomeBatchOp (extraOp : [SomeBatchOp utxoOps, SomeBatchOp stakesOps])
 --   where
@@ -135,9 +154,9 @@ data ApplyBlocksSettings extra m = ApplyBlocksSettings
 --             Just x  -> DB.PutTotalStake x : stakesOpsAlmost
 --     extraOp = convertExtra extra
 
--- -- | Convert simple 'ToilModifier' to batch of database operations.
--- toilModifierToBatch :: HasConfiguration => ToilModifier -> SomeBatchOp
--- toilModifierToBatch = genericToilModifierToBatch (const mempty)
+-- | Convert simple 'GlobalToilState' to batch of database operations.
+toilModifierToBatch :: HasConfiguration => GlobalToilState -> SomeBatchOp
+toilModifierToBatch = genericToilModifierToBatch (const mempty)
 
 -- -- | Run action which requires toil interfaces.
 -- runToilAction

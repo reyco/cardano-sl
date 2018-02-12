@@ -43,7 +43,7 @@ import           Pos.StateLock (Priority (..), StateLock, StateLockMetrics, with
 import           Pos.Txp.MemState (GenericTxpLocalData (..), GenericTxpLocalDataPure, MempoolExt,
                                    MonadTxpMem, TxpLocalWorkMode, askTxpMem, getLocalTxsMap,
                                    getUtxoModifier, modifyTxpLocalData, setTxpLocalData)
-import           Pos.Txp.Toil (DBToil, GenericToilModifier (..), MonadUtxoRead (..), ToilT,
+import           Pos.Txp.Toil (GenericToilModifier (..), MonadUtxoRead (..), ToilT,
                                ToilVerFailure (..), Utxo, mpLocalTxs, normalizeToil, processTx,
                                runDBToil, runToilTLocal, runToilTLocalExtra, utxoGetReader)
 import           Pos.Txp.Topsort (topsortTxs)
