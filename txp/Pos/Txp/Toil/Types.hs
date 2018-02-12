@@ -5,7 +5,6 @@
 
 module Pos.Txp.Toil.Types
        ( Utxo
-       , UtxoLookup
        , UtxoModifier
        , formatUtxo
        , utxoF
@@ -14,7 +13,6 @@ module Pos.Txp.Toil.Types
        , _GenesisUtxo
 
        , StakesView (..)
-       , StakesLookup
        , svStakes
        , svTotal
 
@@ -59,9 +57,6 @@ import qualified Pos.Util.Modifier as MM
 -- output) pairs.
 type Utxo = Map TxIn TxOutAux
 
--- | Type of function to look up an entry in 'Utxo'.
-type UtxoLookup = TxIn -> Maybe TxOutAux
-
 -- | All modifications (additions and deletions) to be applied to 'Utxo'.
 type UtxoModifier = MM.MapModifier TxIn TxOutAux
 
@@ -95,9 +90,6 @@ newtype TxFee = TxFee Coin
 ----------------------------------------------------------------------------
 -- StakesView
 ----------------------------------------------------------------------------
-
--- | Type of function to look up an entry in stakes map.
-type StakesLookup = StakeholderId -> Maybe Coin
 
 data StakesView = StakesView
     { _svStakes :: !(HashMap StakeholderId Coin)

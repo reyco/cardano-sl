@@ -1,3 +1,5 @@
+{-# LANGUAGE DeriveFunctor #-}
+
 -- | Some monads used in Toil and primitive actions.
 
 module Pos.Txp.Toil.Monadic
@@ -34,29 +36,36 @@ module Pos.Txp.Toil.Monadic
 import           Universum
 
 import           Control.Lens (at, magnify, makeLenses, zoom, (%=), (+=), (.=))
+import           Control.Monad.Free (Free (..), hoistFree)
 import           Control.Monad.Reader (mapReaderT)
 import           Fmt ((+|), (|+))
 import           System.Wlog (NamedPureLogger)
 
 import           Pos.Core.Common (Coin, StakeholderId)
 import           Pos.Core.Txp (TxAux, TxId, TxIn, TxOutAux, TxUndo)
-import           Pos.Txp.Toil.Types (MemPool, StakesLookup, StakesView, UndoMap, UtxoLookup,
-                                     UtxoModifier, mpLocalTxs, mpSize, svStakes, svTotal)
+import           Pos.Txp.Toil.Types (MemPool, StakesView, UndoMap, UtxoModifier, mpLocalTxs, mpSize,
+                                     svStakes, svTotal)
 import qualified Pos.Util.Modifier as MM
 
 ----------------------------------------------------------------------------
 -- Monadic actions with Utxo.
 ----------------------------------------------------------------------------
 
+-- | Type which parameterizes free monad with access to Utxo.
+data UtxoLookupF a = UtxoLookupF TxIn (Maybe TxOutAux -> a)
+    deriving (Functor)
+
 -- | Utility monad which allows to lookup values in UTXO and modify it.
-type UtxoM = ReaderT UtxoLookup (State UtxoModifier)
+type UtxoM = StateT UtxoModifier (Free UtxoLookupF)
 
 -- | Look up an entry in 'Utxo' considering 'UtxoModifier' stored
 -- inside 'State'.
 utxoGet :: TxIn -> UtxoM (Maybe TxOutAux)
 utxoGet txIn = do
-    utxoLookup <- ask
-    MM.lookup utxoLookup txIn <$> use identity
+    MM.lookupM baseLookup txIn =<< use identity
+  where
+    baseLookup :: TxIn -> UtxoM (Maybe TxOutAux)
+    baseLookup i = lift $ Free $ UtxoLookupF i pure
 
 -- | Add an unspent output to UTXO. If it's already there, throw an 'error'.
 utxoPut :: TxIn -> TxOutAux -> UtxoM ()
@@ -86,7 +95,7 @@ data LocalToilState = LocalToilState
 
 makeLenses ''LocalToilState
 
-type LocalToilM = ReaderT UtxoLookup (State LocalToilState)
+type LocalToilM = StateT LocalToilState (Free UtxoLookupF)
 
 -- | Check whether Tx with given identifier is stored in the pool.
 hasTx :: TxId -> LocalToilM Bool
@@ -109,6 +118,13 @@ memPoolSize = use $ ltsMemPool . mpSize
 -- Monad used for global Toil and some actions.
 ----------------------------------------------------------------------------
 
+-- | Type which parameterizes free monad with access to Utxo and Stakes.
+data GlobalLookupF a
+    = GlobalLookupUtxo (UtxoLookupF a)
+    | GlobalLookupStakes StakeholderId
+                         (Maybe Coin -> a)
+    deriving (Functor)
+
 data GlobalToilState = GlobalToilState
     { _gtsUtxoModifier :: !UtxoModifier
     , _gtsStakesView   :: !StakesView
@@ -117,20 +133,19 @@ data GlobalToilState = GlobalToilState
 makeLenses ''GlobalToilState
 
 data GlobalToilEnv = GlobalToilEnv
-    { _gteUtxo       :: !UtxoLookup
-    , _gteStakes     :: !StakesLookup
-    , _gteTotalStake :: !Coin
+    { _gteTotalStake :: !Coin
     }
 
 makeLenses ''GlobalToilEnv
 
 type GlobalToilM
-     = NamedPureLogger (ReaderT GlobalToilEnv (State GlobalToilState))
+     = NamedPureLogger (ReaderT GlobalToilEnv (StateT GlobalToilState (Free GlobalLookupF)))
 
 getStake :: StakeholderId -> GlobalToilM (Maybe Coin)
 getStake id = lift $ do
-    stakesLookup <- view gteStakes
-    (<|> stakesLookup id) <$> (use (gtsStakesView . svStakes . at id))
+    undefined
+    -- stakesLookup <- view gteStakes
+    -- (<|> stakesLookup id) <$> (use (gtsStakesView . svStakes . at id))
 
 getTotalStake :: GlobalToilM Coin
 getTotalStake =
@@ -148,17 +163,12 @@ setTotalStake c = lift $ gtsStakesView . svTotal .= Just c
 
 -- | Lift 'UtxoM' action to 'LocalToilM'.
 utxoMToLocalToilM :: UtxoM a -> LocalToilM a
-utxoMToLocalToilM = mapReaderT f
-  where
-    f :: forall a. State UtxoModifier a -> State LocalToilState a
-    f = zoom ltsUtxoModifier
+utxoMToLocalToilM = zoom ltsUtxoModifier
 
 -- | Lift 'UtxoM' action to 'GlobalToilM'.
 utxoMToGlobalToilM :: UtxoM a -> GlobalToilM a
-utxoMToGlobalToilM = lift . magnify gteUtxo . mapReaderT f
-  where
-    f :: forall a. State UtxoModifier a -> State GlobalToilState a
-    f = zoom gtsUtxoModifier
+utxoMToGlobalToilM =
+    lift . lift . zoom gtsUtxoModifier . hoistFree GlobalLookupUtxo
 
 
 
