@@ -1,6 +1,6 @@
--- | ToilT monad transformer. Single-threaded.
+-- | Some monads used in Toil and primitive actions.
 
-module Pos.Txp.Toil.Trans
+module Pos.Txp.Toil.Monadic
        (
          -- * Monadic Utxo
          UtxoM
@@ -21,6 +21,10 @@ module Pos.Txp.Toil.Trans
          -- * Monadic global Toil
        , GlobalToilState (..)
        , GlobalToilM
+       , getStake
+       , getTotalStake
+       , setStake
+       , setTotalStake
 
          -- * Conversions
        , utxoMToLocalToilM
@@ -44,6 +48,7 @@ import qualified Ether
 import           Fmt ((+|), (|+))
 import           System.Wlog (NamedPureLogger)
 
+import           Pos.Core.Common (Coin, StakeholderId)
 import           Pos.Core.Txp (TxAux, TxId, TxIn, TxOutAux, TxUndo)
 import           Pos.Txp.Toil.Class (MonadStakes (..), MonadStakesRead (..))
 import           Pos.Txp.Toil.Types (GenericToilModifier (..), MemPool, StakesView, ToilModifier,
@@ -127,8 +132,17 @@ makeLenses ''GlobalToilState
 type GlobalToilM = NamedPureLogger (ReaderT UtxoLookup (State GlobalToilState))
 
 
+getStake :: StakeholderId -> GlobalToilM (Maybe Coin)
+getStake = undefined
 
+getTotalStake :: GlobalToilM Coin
+getTotalStake = undefined
 
+setStake :: StakeholderId -> Coin -> GlobalToilM ()
+setStake = undefined
+
+setTotalStake :: Coin -> GlobalToilM ()
+setTotalStake = undefined
 
 ----------------------------------------------------------------------------
 -- Conversions
