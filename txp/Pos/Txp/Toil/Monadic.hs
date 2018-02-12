@@ -4,7 +4,7 @@ module Pos.Txp.Toil.Monadic
        (
          -- * Monadic Utxo
          UtxoM
-       , utxoGetModified
+       , utxoGet
        , utxoPut
        , utxoDel
 
@@ -29,33 +29,20 @@ module Pos.Txp.Toil.Monadic
          -- * Conversions
        , utxoMToLocalToilM
        , utxoMToGlobalToilM
-
-         -- * Old code
-       , ToilT
-       , runToilTGlobal
-       , runToilTLocal
-       , execToilTLocal
-       , runToilTLocalExtra
-       , evalToilTEmpty
        ) where
 
 import           Universum
 
-import           Control.Lens (at, makeLenses, zoom, (%=), (+=), (.=))
+import           Control.Lens (at, magnify, makeLenses, zoom, (%=), (+=), (.=))
 import           Control.Monad.Reader (mapReaderT)
-import           Data.Default (Default (def))
-import qualified Ether
 import           Fmt ((+|), (|+))
 import           System.Wlog (NamedPureLogger)
 
 import           Pos.Core.Common (Coin, StakeholderId)
 import           Pos.Core.Txp (TxAux, TxId, TxIn, TxOutAux, TxUndo)
-import           Pos.Txp.Toil.Class (MonadStakes (..), MonadStakesRead (..))
-import           Pos.Txp.Toil.Types (GenericToilModifier (..), MemPool, StakesView, ToilModifier,
-                                     UndoMap, UtxoLookup, UtxoModifier, mpLocalTxs, mpSize,
-                                     svStakes, svTotal, tmStakes)
+import           Pos.Txp.Toil.Types (MemPool, StakesLookup, StakesView, UndoMap, UtxoLookup,
+                                     UtxoModifier, mpLocalTxs, mpSize, svStakes, svTotal)
 import qualified Pos.Util.Modifier as MM
-import           Pos.Util.Util (ether)
 
 ----------------------------------------------------------------------------
 -- Monadic actions with Utxo.
@@ -66,14 +53,14 @@ type UtxoM = ReaderT UtxoLookup (State UtxoModifier)
 
 -- | Look up an entry in 'Utxo' considering 'UtxoModifier' stored
 -- inside 'State'.
-utxoGetModified :: TxIn -> UtxoM (Maybe TxOutAux)
-utxoGetModified txIn = do
-    utxoGet <- ask
-    MM.lookup utxoGet txIn <$> use identity
+utxoGet :: TxIn -> UtxoM (Maybe TxOutAux)
+utxoGet txIn = do
+    utxoLookup <- ask
+    MM.lookup utxoLookup txIn <$> use identity
 
 -- | Add an unspent output to UTXO. If it's already there, throw an 'error'.
 utxoPut :: TxIn -> TxOutAux -> UtxoM ()
-utxoPut id txOut = utxoGetModified id >>= \case
+utxoPut id txOut = utxoGet id >>= \case
     Nothing -> identity %= MM.insert id txOut
     Just _  ->
         -- TODO [CSL-2173]: Comment
@@ -81,7 +68,7 @@ utxoPut id txOut = utxoGetModified id >>= \case
 
 -- | Delete an unspent input from UTXO. If it's not there, throw an 'error'.
 utxoDel :: TxIn -> UtxoM ()
-utxoDel id = utxoGetModified id >>= \case
+utxoDel id = utxoGet id >>= \case
     Just _  -> identity %= MM.delete id
     Nothing ->
         -- TODO [CSL-2173]: Comment
@@ -123,26 +110,37 @@ memPoolSize = use $ ltsMemPool . mpSize
 ----------------------------------------------------------------------------
 
 data GlobalToilState = GlobalToilState
-    { _gtsUtxoModifier   :: !UtxoModifier
-    , _gtsStakesModifier :: !StakesView
+    { _gtsUtxoModifier :: !UtxoModifier
+    , _gtsStakesView   :: !StakesView
     }
 
 makeLenses ''GlobalToilState
 
-type GlobalToilM = NamedPureLogger (ReaderT UtxoLookup (State GlobalToilState))
+data GlobalToilEnv = GlobalToilEnv
+    { _gteUtxo       :: !UtxoLookup
+    , _gteStakes     :: !StakesLookup
+    , _gteTotalStake :: !Coin
+    }
 
+makeLenses ''GlobalToilEnv
+
+type GlobalToilM
+     = NamedPureLogger (ReaderT GlobalToilEnv (State GlobalToilState))
 
 getStake :: StakeholderId -> GlobalToilM (Maybe Coin)
-getStake = undefined
+getStake id = lift $ do
+    stakesLookup <- view gteStakes
+    (<|> stakesLookup id) <$> (use (gtsStakesView . svStakes . at id))
 
 getTotalStake :: GlobalToilM Coin
-getTotalStake = undefined
+getTotalStake =
+    lift $ maybe (view gteTotalStake) pure =<< use (gtsStakesView . svTotal)
 
 setStake :: StakeholderId -> Coin -> GlobalToilM ()
-setStake = undefined
+setStake id c = lift $ gtsStakesView . svStakes . at id .= Just c
 
 setTotalStake :: Coin -> GlobalToilM ()
-setTotalStake = undefined
+setTotalStake c = lift $ gtsStakesView . svTotal .= Just c
 
 ----------------------------------------------------------------------------
 -- Conversions
@@ -157,7 +155,7 @@ utxoMToLocalToilM = mapReaderT f
 
 -- | Lift 'UtxoM' action to 'GlobalToilM'.
 utxoMToGlobalToilM :: UtxoM a -> GlobalToilM a
-utxoMToGlobalToilM = lift . mapReaderT f
+utxoMToGlobalToilM = lift . magnify gteUtxo . mapReaderT f
   where
     f :: forall a. State UtxoModifier a -> State GlobalToilState a
     f = zoom gtsUtxoModifier
@@ -171,80 +169,55 @@ utxoMToGlobalToilM = lift . mapReaderT f
 -- Obsolete
 ----------------------------------------------------------------------------
 
--- | Monad transformer which stores ToilModifier and implements
--- writable Toil type classes.
---
--- [WARNING] This transformer uses StateT and is intended for
--- single-threaded usage only.
--- Used for block application now.
-type ToilT ext m = Ether.StateT' (GenericToilModifier ext) m
+-- runToilTGlobal
+--     :: (Default ext, Functor m)
+--     => ToilT ext m a -> m (a, GenericToilModifier ext)
+-- runToilTGlobal txpt = Ether.runStateT' txpt def
 
-instance MonadStakesRead m => MonadStakesRead (ToilT __ m) where
-    getStake id =
-        ether $ (<|>) <$> use (tmStakes . svStakes . at id) <*> getStake id
-    getTotalStake =
-        ether $ maybe getTotalStake pure =<< use (tmStakes . svTotal)
+-- -- | Run ToilT using empty stakes modifier. Should be used for local
+-- -- transaction processing.
+-- runToilTLocal
+--     :: (Functor m)
+--     => UtxoModifier
+--     -> MemPool
+--     -> UndoMap
+--     -> ToilT () m a
+--     -> m (a, ToilModifier)
+-- runToilTLocal um mp undo txpt =
+--     Ether.runStateT' txpt (def {_tmUtxo = um, _tmMemPool = mp, _tmUndos = undo})
 
-instance MonadStakesRead m => MonadStakes (ToilT __ m) where
-    setStake id c = ether $ tmStakes . svStakes . at id .= Just c
+-- evalToilTEmpty
+--     :: Monad m
+--     => ToilT () m a
+--     -> m a
+-- evalToilTEmpty txpt = Ether.evalStateT txpt def
 
-    setTotalStake c = ether $ tmStakes . svTotal .= Just c
+-- -- | Execute ToilT using empty stakes modifier. Should be used for
+-- -- local transaction processing.
+-- execToilTLocal
+--     :: (Functor m)
+--     => UtxoModifier
+--     -> MemPool
+--     -> UndoMap
+--     -> ToilT () m a
+--     -> m ToilModifier
+-- execToilTLocal um mp undo = fmap snd . runToilTLocal um mp undo
 
-----------------------------------------------------------------------------
--- Runners
-----------------------------------------------------------------------------
-
--- | Run ToilT using empty modifier. Should be used for global
--- transaction processing.
-runToilTGlobal
-    :: (Default ext, Functor m)
-    => ToilT ext m a -> m (a, GenericToilModifier ext)
-runToilTGlobal txpt = Ether.runStateT' txpt def
-
--- | Run ToilT using empty stakes modifier. Should be used for local
--- transaction processing.
-runToilTLocal
-    :: (Functor m)
-    => UtxoModifier
-    -> MemPool
-    -> UndoMap
-    -> ToilT () m a
-    -> m (a, ToilModifier)
-runToilTLocal um mp undo txpt =
-    Ether.runStateT' txpt (def {_tmUtxo = um, _tmMemPool = mp, _tmUndos = undo})
-
-evalToilTEmpty
-    :: Monad m
-    => ToilT () m a
-    -> m a
-evalToilTEmpty txpt = Ether.evalStateT txpt def
-
--- | Execute ToilT using empty stakes modifier. Should be used for
--- local transaction processing.
-execToilTLocal
-    :: (Functor m)
-    => UtxoModifier
-    -> MemPool
-    -> UndoMap
-    -> ToilT () m a
-    -> m ToilModifier
-execToilTLocal um mp undo = fmap snd . runToilTLocal um mp undo
-
--- | Like 'runToilTLocal', but takes extra data as argument.
-runToilTLocalExtra
-    :: (Functor m)
-    => UtxoModifier
-    -> MemPool
-    -> UndoMap
-    -> extra
-    -> ToilT extra m a
-    -> m (a, GenericToilModifier extra)
-runToilTLocalExtra um mp undo e =
-    flip Ether.runStateT' $
-        ToilModifier
-        { _tmUtxo = um
-        , _tmStakes = def
-        , _tmMemPool = mp
-        , _tmUndos = undo
-        , _tmExtra = e
-        }
+-- -- | Like 'runToilTLocal', but takes extra data as argument.
+-- runToilTLocalExtra
+--     :: (Functor m)
+--     => UtxoModifier
+--     -> MemPool
+--     -> UndoMap
+--     -> extra
+--     -> ToilT extra m a
+--     -> m (a, GenericToilModifier extra)
+-- runToilTLocalExtra um mp undo e =
+--     flip Ether.runStateT' $
+--         ToilModifier
+--         { _tmUtxo = um
+--         , _tmStakes = def
+--         , _tmMemPool = mp
+--         , _tmUndos = undo
+--         , _tmExtra = e
+--         }

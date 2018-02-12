@@ -6,9 +6,7 @@
 -- MonadStakes and MonadTxPool.
 
 module Pos.Txp.Toil.Logic
-       ( GlobalApplyToilMode
-       , GlobalVerifyToilMode
-       , verifyToil
+       ( verifyToil
        , applyToil
        , rollbackToil
 
@@ -20,7 +18,6 @@ import           Universum
 
 import           Control.Monad.Except (ExceptT, mapExceptT, throwError)
 import           Serokell.Data.Memory.Units (Byte)
-import           System.Wlog (WithLogger)
 
 import           Pos.Binary.Class (biSize)
 import           Pos.Core (AddrAttributes (..), AddrStakeDistribution (..), Address,
@@ -32,12 +29,12 @@ import           Pos.Core.Configuration (HasConfiguration, memPoolLimitTx)
 import           Pos.Core.Txp (Tx (..), TxAux (..), TxId, TxOut (..), TxUndo, TxpUndo, toaOut,
                                txInputs, txOutAddress)
 import           Pos.Crypto (WithHash (..), hash)
-import           Pos.Txp.Toil.Class (MonadStakes (..))
 import           Pos.Txp.Toil.Failure (ToilVerFailure (..))
+import           Pos.Txp.Toil.Monadic (GlobalToilM, LocalToilM, UtxoM, hasTx, memPoolSize,
+                                       putTxWithUndo, utxoGet, utxoMToGlobalToilM,
+                                       utxoMToLocalToilM)
 import           Pos.Txp.Toil.Stakes (applyTxsToStakes, rollbackTxsStakes)
-import           Pos.Txp.Toil.Trans (GlobalToilM, LocalToilM, UtxoM, hasTx, memPoolSize,
-                                     putTxWithUndo, utxoMToGlobalToilM, utxoMToLocalToilM)
-import           Pos.Txp.Toil.Types (TxFee (..), UtxoLookup)
+import           Pos.Txp.Toil.Types (TxFee (..))
 import qualified Pos.Txp.Toil.Utxo as Utxo
 import           Pos.Txp.Topsort (topsortTxs)
 import           Pos.Util (eitherToMonadError)
@@ -46,48 +43,38 @@ import           Pos.Util (eitherToMonadError)
 -- Global
 ----------------------------------------------------------------------------
 
-type GlobalApplyToilMode m =
-    ( MonadStakes m
-    , WithLogger m
-    )
-
-type GlobalVerifyToilMode m =
-    ( MonadStakes m
-    , WithLogger m
-    )
-
 -- CHECK: @verifyToil
 -- | Verify transactions correctness with respect to Utxo applying
 -- them one-by-one.
 -- Note: transactions must be topsorted to pass check.
 -- Warning: this function may apply some transactions and fail
--- eventually. Use it only on temporary data.
+-- eventually.
 --
--- If the first argument is 'True', all data (script versions,
+-- If the 'Bool' argument is 'True', all data (script versions,
 -- witnesses, addresses, attributes) must be known. Otherwise unknown
 -- data is just ignored.
 verifyToil ::
-       forall m. (GlobalVerifyToilMode m)
+       HasConfiguration
     => BlockVersionData
     -> EpochIndex
     -> Bool
     -> [TxAux]
-    -> m (Either ToilVerFailure TxpUndo)
-verifyToil bvd curEpoch verifyAllIsKnown = undefined
-    -- mapM (verifyAndApplyTx curEpoch verifyAllIsKnown . withTxId)
+    -> ExceptT ToilVerFailure UtxoM TxpUndo
+verifyToil bvd curEpoch verifyAllIsKnown =
+    mapM (verifyAndApplyTx bvd curEpoch verifyAllIsKnown . withTxId)
 
 -- | Apply transactions from one block. They must be valid (for
 -- example, it implies topological sort).
-applyToil :: [(TxAux, TxUndo)] -> GlobalToilM ()
+applyToil :: HasConfiguration => [(TxAux, TxUndo)] -> GlobalToilM ()
 applyToil [] = pass
 applyToil txun = do
-    -- applyTxsToStakes txun
+    applyTxsToStakes txun
     utxoMToGlobalToilM $ mapM_ (applyTxToUtxo' . withTxId . fst) txun
 
 -- | Rollback transactions from one block.
-rollbackToil :: [(TxAux, TxUndo)] -> GlobalToilM ()
+rollbackToil :: HasConfiguration => [(TxAux, TxUndo)] -> GlobalToilM ()
 rollbackToil txun = do
-    -- rollbackTxsStakes txun
+    rollbackTxsStakes txun
     utxoMToGlobalToilM $ mapM_ Utxo.rollbackTxUtxo $ reverse txun
 
 ----------------------------------------------------------------------------
@@ -139,33 +126,32 @@ verifyAndApplyTx ::
     -> (TxId, TxAux)
     -> ExceptT ToilVerFailure UtxoM TxUndo
 verifyAndApplyTx adoptedBVD curEpoch verifyVersions tx@(_, txAux) = do
-    utxoGet <- ask
-    let ctx = Utxo.VTxContext verifyVersions utxoGet
-    txUndo <- eitherToMonadError $ do
-        Utxo.VerifyTxUtxoRes {..} <- Utxo.verifyTxUtxo ctx txAux
-        vturUndo <$ verifyGState adoptedBVD curEpoch txAux vturFee
+    Utxo.VerifyTxUtxoRes {..} <- Utxo.verifyTxUtxo ctx txAux
+    verifyGState adoptedBVD curEpoch txAux vturFee
     lift $ applyTxToUtxo' tx
-    pure txUndo
-
-isRedeemTx :: UtxoLookup -> TxAux ->  Bool
-isRedeemTx utxoGet txAux = all isRedeemAddress inputAddresses
+    pure vturUndo
   where
-    resolvedOuts = map utxoGet $ (view txInputs . taTx) txAux
-    inputAddresses =
-        fmap (txOutAddress . toaOut) . catMaybes . toList $ resolvedOuts
+    ctx = Utxo.VTxContext verifyVersions
+
+isRedeemTx :: TxAux -> UtxoM Bool
+isRedeemTx txAux = do
+    resolvedOuts <- mapM utxoGet $ (view txInputs . taTx) txAux
+    let inputAddresses =
+            fmap (txOutAddress . toaOut) . catMaybes . toList $ resolvedOuts
+    return $ all isRedeemAddress inputAddresses
 
 verifyGState ::
        BlockVersionData
     -> EpochIndex
     -> TxAux
     -> Maybe TxFee
-    -> Either ToilVerFailure ()
+    -> ExceptT ToilVerFailure UtxoM ()
 verifyGState bvd@BlockVersionData {..} curEpoch txAux txFeeMB = do
-    verifyBootEra bvd curEpoch txAux
+    eitherToMonadError $ verifyBootEra bvd curEpoch txAux
     let txSize = biSize txAux
     let limit = bvdMaxTxSize
-    unless (isRedeemTx undefined txAux) $ whenJust txFeeMB $ \txFee ->
-        verifyTxFeePolicy txFee bvdTxFeePolicy txSize
+    unlessM (lift $ isRedeemTx txAux) $ whenJust txFeeMB $ \txFee ->
+        eitherToMonadError $ verifyTxFeePolicy txFee bvdTxFeePolicy txSize
     when (txSize > limit) $
         throwError ToilTooLargeTx {ttltSize = txSize, ttltLimit = limit}
 

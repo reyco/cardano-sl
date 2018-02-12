@@ -13,13 +13,14 @@ import qualified Data.HashMap.Strict as HM
 import qualified Data.HashSet as HS
 import           Formatting (sformat, (%))
 import           Serokell.Util.Text (listJson)
-import           System.Wlog (WithLogger, logDebug)
+import           System.Wlog (logDebug)
 
 import           Pos.Core (HasGenesisData, StakesList, coinToInteger, mkCoin, sumCoins,
                            unsafeIntegerToCoin)
 import           Pos.Core.Txp (Tx (..), TxAux (..), TxOutAux (..), TxUndo)
 import           Pos.Txp.Base (txOutStake)
-import           Pos.Txp.Toil.Trans (GlobalToilM, getStake, getTotalStake, setStake, setTotalStake)
+import           Pos.Txp.Toil.Monadic (GlobalToilM, getStake, getTotalStake, setStake,
+                                       setTotalStake)
 
 -- | Apply transactions to stakes.
 applyTxsToStakes :: HasGenesisData => [(TxAux, TxUndo)] -> GlobalToilM ()

@@ -29,8 +29,9 @@ import           Pos.Crypto (SignTag (SignRedeemTx, SignTx), WithHash (..), chec
 import           Pos.Data.Attributes (Attributes (attrRemain), areAttributesKnown)
 import           Pos.Script (Script (..), isKnownScriptVersion, txScriptCheck)
 import           Pos.Txp.Toil.Failure (ToilVerFailure (..), WitnessVerFailure (..))
-import           Pos.Txp.Toil.Trans (UtxoM, utxoDel, utxoPut)
-import           Pos.Txp.Toil.Types (TxFee (..), UtxoLookup)
+import           Pos.Txp.Toil.Monadic (UtxoM, utxoDel, utxoGet, utxoPut)
+import           Pos.Txp.Toil.Types (TxFee (..))
+import           Pos.Util (eitherToMonadError)
 
 ----------------------------------------------------------------------------
 -- Verification
@@ -45,9 +46,6 @@ data VTxContext = VTxContext
     { -- | Verify that script versions in tx are known, addresses' and
       -- witnesses' types are known, attributes are known too.
       vtcVerifyAllIsKnown :: !Bool
-    , -- | Subset of UTXO relevant for verifying a particular
-      -- transaction.
-      vtcUtxo             :: !UtxoLookup
 --    , vtcSlotId   :: !SlotId         -- ^ Slot id of block transaction is checked in
 --    , vtcLeaderId :: !StakeholderId  -- ^ Leader id of block transaction is checked in
     }
@@ -82,7 +80,7 @@ verifyTxUtxo ::
        HasConfiguration
     => VTxContext
     -> TxAux
-    -> Either ToilVerFailure VerifyTxUtxoRes
+    -> ExceptT ToilVerFailure UtxoM VerifyTxUtxoRes
 verifyTxUtxo ctx@VTxContext {..} ta@(TxAux UnsafeTx {..} witnesses) = do
     let unknownTxInMB = find (isTxInUnknown . snd) $ zip [0..] (toList _txInputs)
     case (vtcVerifyAllIsKnown, unknownTxInMB) of
@@ -91,8 +89,10 @@ verifyTxUtxo ctx@VTxContext {..} ta@(TxAux UnsafeTx {..} witnesses) = do
         (False, Just _) -> do
             -- Case when at least one input isn't known
             minimalReasonableChecks
-            let resolvedInputs :: NonEmpty (Maybe (TxIn, TxOutAux))
-                resolvedInputs = map (rightToMaybe . resolveInput ctx) _txInputs
+            resolvedInputs :: NonEmpty (Maybe (TxIn, TxOutAux)) <-
+                mapM
+                    (lift . fmap rightToMaybe . runExceptT . resolveInput)
+                    _txInputs
             pure VerifyTxUtxoRes
                  { vturUndo = map (fmap snd) resolvedInputs
                  , vturFee = Nothing
@@ -100,24 +100,25 @@ verifyTxUtxo ctx@VTxContext {..} ta@(TxAux UnsafeTx {..} witnesses) = do
         _               -> do
             -- Case when all inputs are known
             minimalReasonableChecks
-            resolvedInputs <- mapM (resolveInput ctx) _txInputs
-            txFee <- verifySums resolvedInputs _txOutputs
-            verifyKnownInputs ctx resolvedInputs ta
-            when vtcVerifyAllIsKnown $ verifyAttributesAreKnown _txAttributes
-            pure VerifyTxUtxoRes
-                 { vturUndo = map (Just . snd) resolvedInputs
-                 , vturFee = Just txFee
-                 }
+            resolvedInputs <- mapM resolveInput _txInputs
+            eitherToMonadError $ do
+                txFee <- verifySums resolvedInputs _txOutputs
+                verifyKnownInputs ctx resolvedInputs ta
+                when vtcVerifyAllIsKnown $ verifyAttributesAreKnown _txAttributes
+                pure VerifyTxUtxoRes
+                    { vturUndo = map (Just . snd) resolvedInputs
+                    , vturFee = Just txFee
+                    }
   where
-    minimalReasonableChecks :: Either ToilVerFailure ()
-    minimalReasonableChecks = do
+    minimalReasonableChecks :: ExceptT ToilVerFailure UtxoM ()
+    minimalReasonableChecks = eitherToMonadError $ do
         verifyConsistency _txInputs witnesses
         verResToMonadError (ToilInvalidOutputs . formatFirstError) $
             verifyOutputs ctx ta
 
-resolveInput :: VTxContext -> TxIn -> Either ToilVerFailure (TxIn, TxOutAux)
-resolveInput VTxContext {..} txIn =
-    (txIn, ) <$> (maybeToRight (ToilNotUnspent txIn) (vtcUtxo txIn))
+resolveInput :: TxIn -> ExceptT ToilVerFailure UtxoM (TxIn, TxOutAux)
+resolveInput txIn =
+    (txIn, ) <$> (note (ToilNotUnspent txIn) =<< lift (utxoGet txIn))
 
 verifySums ::
        NonEmpty (TxIn, TxOutAux)
