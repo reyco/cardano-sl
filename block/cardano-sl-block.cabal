@@ -17,7 +17,6 @@ library
                         Pos.Arbitrary.Block.Message
 
                         Pos.Block.Base
-                        Pos.Block.BHelpers
                         Pos.Block.BListener
                         Pos.Block.BlockWorkMode
                         Pos.Block.Configuration
@@ -28,6 +27,7 @@ library
                         Pos.Block.RetrievalQueue
                         Pos.Block.Slog
                         Pos.Block.Types
+                        Pos.Block.Verification
 
                         Pos.Block.Network
                         Pos.Block.Network.Logic
