@@ -6,6 +6,7 @@ module Pos.Txp.Toil.Monadic
        (
          -- * Monadic Utxo
          UtxoM
+       , runUtxoM
        , utxoGet
        , utxoPut
        , utxoDel
@@ -37,7 +38,7 @@ module Pos.Txp.Toil.Monadic
 import           Universum
 
 import           Control.Lens (at, makeLenses, zoom, (%=), (+=), (.=))
-import           Control.Monad.Free (Free (..), hoistFree)
+import           Control.Monad.Free (Free (..), foldFree, hoistFree)
 import           Control.Monad.State.Strict (mapStateT)
 import           Fmt ((+|), (|+))
 import           System.Wlog (NamedPureLogger)
@@ -58,6 +59,19 @@ data UtxoLookupF a = UtxoLookupF TxIn (Maybe TxOutAux -> a)
 
 -- | Utility monad which allows to lookup values in UTXO and modify it.
 type UtxoM = StateT UtxoModifier (Free UtxoLookupF)
+
+-- | Run 'UtxoM' action in some monad capable of getting 'TxOutAux'
+-- for 'TxIn'.
+runUtxoM ::
+       forall m a. Monad m
+    => UtxoModifier
+    -> (TxIn -> m (Maybe TxOutAux))
+    -> UtxoM a
+    -> m (a, UtxoModifier)
+runUtxoM modifier getter = foldFree' . usingStateT modifier
+  where
+    foldFree' :: forall x. Free UtxoLookupF x -> m x
+    foldFree' = foldFree $ \(UtxoLookupF txIn f) -> f <$> getter txIn
 
 -- | Look up an entry in 'Utxo' considering 'UtxoModifier' stored
 -- inside 'State'.
