@@ -89,13 +89,16 @@ echo "Done."
 # For now we dont have macOS developers on explorer
 if [[ ("$OS_NAME" == "linux") ]]; then
   # Generate explorer frontend
-  export EXPLORER_EXECUTABLE=$(pwd)/cardano-sl-explorer-static.root/bin/cardano-explorer-hs2purs
-  ./explorer/frontend/scripts/build.sh
+  export EXPLORER_EXECUTABLE=
+  nix-build -A dist -o explorer-frontend-dist \
+            --argstr gitrev $BUILDKITE_COMMIT \
+            --arg cardano-sl-explorer `readlink $(pwd)/cardano-sl-explorer-static.root` \
+            ./explorer/frontend/default.nix
 
   echo "Packing up explorer-frontend ..."
   APP_NAME=cardano-sl-explorer
   mkdir -p ${APP_NAME}
-  tar cJf ${APP_NAME}/explorer-frontend-$BUILD_UID.tar.xz explorer/frontend/dist
+  tar cJf ${APP_NAME}/explorer-frontend-$BUILD_UID.tar.xz explorer-frontend-dist
   echo "Uploading.."
   buildkite-agent artifact upload "${APP_NAME}/explorer-frontend-$BUILD_UID.tar.xz" s3://${ARTIFACT_BUCKET} --job $BUILDKITE_JOB_ID
   echo "Done."
