@@ -14880,7 +14880,7 @@ devnet: &devnet
         protocolConstants:
           <<: *mainnet_base_protocolConstants
           protocolMagic: 170987650
-          k: 6 # set to desired value
+          k: 9 # set to desired value
         avvmDistr: *mainnet_avvmDistr
         initializer:
           testBalance:
@@ -14901,7 +14901,7 @@ devnet: &devnet
 
   update:
     applicationName: cardano-sl
-    applicationVersion: 0
+    applicationVersion: 1
     lastKnownBlockVersion:
       bvMajor: 0
       bvMinor: 0
@@ -14912,6 +14912,30 @@ devnet: &devnet
     <<: *mainnet_base_node
     networkDiameter: 18 # should be slightly less than slot duration
     recoveryHeadersMessage: 200 # should be greater than k
+
+devnet_staging_win64:
+  <<: *devnet
+  update:
+    <<:
+    applicationName: csl-daedalus
+    applicationVersion: 1
+    lastKnownBlockVersion:
+      bvMajor: 0
+      bvMinor: 0
+      bvAlt: 0
+    systemTag: win64
+
+devnet_staging_macos64:
+  <<: *devnet
+  update:
+    <<:
+    applicationName: csl-daedalus
+    applicationVersion: 1
+    lastKnownBlockVersion:
+      bvMajor: 0
+      bvMinor: 0
+      bvAlt: 0
+    systemTag: macos64
 
 ##############################################################################
 ##                                                                          ##
