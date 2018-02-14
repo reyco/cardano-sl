@@ -119,9 +119,9 @@ type BlockLrcMode ctx m = (MonadBlockApply ctx m, LrcModeFull ctx m)
 -- Algorithm:
 -- 1.  Ensure that the parent of the oldest block that we want to apply
 --     matches the current tip.
--- 2.  Split the list of blocks into sublists where each list contains
---     a sequence of blocks that have the same type (genesis or main)
---     and epoch. See also examples for @spanEpoch@.
+-- 2.  Split the list of blocks into sublists where each list is either
+--     a single genesis block or a (longest possible) sequence of main
+--     blocks. See also examples for @spanEpoch@.
 -- 3.  For each sublist:
 --     3.1. If it consists of a single genesis block, do LRC for the
 --          corresponding epoch if it has not been done yet.
@@ -129,10 +129,10 @@ type BlockLrcMode ctx m = (MonadBlockApply ctx m, LrcModeFull ctx m)
 --          3.2.1. If it fails, either roll back applied blocks or apply
 --                 as many as possible, depending on the @rollback@
 --                 parameter. If we tried to apply as many as possible
---                 but succeeded to apply none, throw, otherwise return
+--                 but managed to apply none, throw, otherwise return
 --                 the new tip.
---          3.2.2. If it succeeds, it returns a list of undos. Make
---                 'Blund's out of them and apply them component-wise
+--          3.2.2. If verification succeeds, it returns a list of undos.
+--                 Make 'Blund's out of them and apply them component-wise
 --                 (@slog@, @us@, @dlg@, @txp@, @ssc@), then perform
 --                 a sanity check.
 -- 4. Normalize all mempools.
@@ -148,15 +148,11 @@ verifyAndApplyBlocks rollback blocks = runExceptT $ do
     lift $ normalizeMempool
     pure hh
   where
-    -- Splits an 'OldestFirst' list of blocks into two lists
-    -- where the first list will contain the longest sequence
-    -- of blocks starting from the oldest one that have the same
-    -- type (genesis or main) and epoch as the first block.
-    -- Examples:
-    -- *  [genesis1, main1, main2, genesis2, main3]
-    --    → [genesis1], [main1, main2, genesis2, main3]
-    -- *  [main1, main2, genesis2, main3]
-    --    → [main1, main2], [genesis2, main3]
+    -- Spans input into @(a, b)@ where @a@ is either a single genesis
+    -- block or a maximum prefix of main blocks from the same epoch.
+    -- Examples (where g is for genesis and m is for main):
+    -- * gmmgm → g, mmgm
+    -- * mmgm → mm, gm
     spanEpoch ::
            OldestFirst NE Block
         -> (OldestFirst NE Block, OldestFirst [] Block)
